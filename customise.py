@@ -40,6 +40,12 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.resolve()
 
+# The repository being customised is on sys.path because this script lives in it, which
+# puts its own (as yet unbuilt) fileformats packages into the namespace -- enough to
+# break any import that walks it, such as resolving a mime-like. Nothing here is
+# imported from the repository, so it is taken back off again.
+sys.path[:] = [p for p in sys.path if p and Path(p).resolve() != REPO_ROOT]
+
 PLACEHOLDER = "CHANGEME"
 NAME_PLACEHOLDER = "<YOUR-NAME>"
 EMAIL_PLACEHOLDER = "<YOUR-EMAIL>"
@@ -77,12 +83,19 @@ TEXT_SUFFIXES = {
 
 FILE = "file"
 FILE_WITH_SIDE_CARS = "file-with-side-cars"
+FILE_WITH_SEPARATE_HEADER = "file-with-separate-header"
 DIRECTORY = "directory"
 
-KIND_DESCRIPTIONS = {
+BINARY = "binary"
+UNICODE = "unicode"
+
+OPTION_DESCRIPTIONS = {
     FILE: "a single file",
-    FILE_WITH_SIDE_CARS: "a file accompanied by side-car files (e.g. a JSON header)",
+    FILE_WITH_SIDE_CARS: "a file accompanied by side-car files (e.g. a JSON sidecar)",
+    FILE_WITH_SEPARATE_HEADER: "a file whose metadata is in a separate header file",
     DIRECTORY: "a directory containing a set of files",
+    BINARY: "contents are binary data",
+    UNICODE: "contents are text",
 }
 
 
@@ -213,6 +226,7 @@ class Prompter:
         key: str,
         question: str,
         validator: ty.Optional[ty.Callable[[str], str]] = None,
+        blank_hint: str = "for none",
     ) -> ty.Optional[str]:
         preset = self._preset(key)
         if preset is not None:
@@ -220,7 +234,7 @@ class Prompter:
                 return None
             return validator(str(preset)) if validator else str(preset)
         while True:
-            answer = self._read(f"{question} (leave blank for none): ")
+            answer = self._read(f"{question} (leave blank {blank_hint}): ")
             if not answer:
                 return None
             if validator is None:
@@ -242,7 +256,7 @@ class Prompter:
             return str(preset)
         print(question)
         for i, option in enumerate(options, start=1):
-            description = KIND_DESCRIPTIONS.get(option, "")
+            description = OPTION_DESCRIPTIONS.get(option, "")
             print(f"  {i}. {option}" + (f" - {description}" if description else ""))
         default_index = list(options).index(default) + 1
         while True:
@@ -255,10 +269,18 @@ class Prompter:
                 return answer
             print(f"  Please enter a number between 1 and {len(options)}")
 
-    def yes_no(self, key: str, question: str, default: bool = True) -> bool:
+    def yes_no(
+        self,
+        key: str,
+        question: str,
+        default: bool = True,
+        explanation: ty.Optional[str] = None,
+    ) -> bool:
         preset = self._preset(key)
         if preset is not None:
             return bool(preset)
+        if explanation:
+            print(explanation)
         suffix = " [Y/n]" if default else " [y/N]"
         while True:
             answer = self._read(f"{question}{suffix}: ").lower()
@@ -445,6 +467,35 @@ def import_namespace_bases(namespace: str) -> ty.List[type]:
 
 
 @dataclass
+class TypeRef:
+    """A reference to the fileformats class of a side-car, header or directory member.
+
+    It is either another format being defined in this run, in which case it is emitted
+    into the same module, or an existing class resolved from its mime-like, in which
+    case it is imported.
+    """
+
+    name: str
+    import_from: ty.Optional[str] = None
+
+    @property
+    def is_local(self) -> bool:
+        return self.import_from is None
+
+
+@dataclass
+class MemberSpec:
+    """A file or directory that a directory format is required, or expected, to hold"""
+
+    attr_name: str
+    type_ref: TypeRef
+    pattern: str
+    is_glob: bool
+    multiple: bool
+    required: bool
+
+
+@dataclass
 class FormatSpec:
     """One format class to generate"""
 
@@ -452,91 +503,418 @@ class FormatSpec:
     kind: str
     docstring: str
     ext: ty.Optional[str] = None
-    side_car_exts: ty.List[str] = field(default_factory=list)
-    content_exts: ty.List[str] = field(default_factory=list)
+    side_car_types: ty.List[TypeRef] = field(default_factory=list)
+    header_type: ty.Optional[TypeRef] = None
+    members: ty.List[MemberSpec] = field(default_factory=list)
+    binary: bool = True
+    has_magic_number: bool = False
+    magic_number: ty.Optional[str] = None
 
     @property
     def var_name(self) -> str:
         return snake_case(self.class_name)
 
+    @property
+    def referenced_at_class_definition(self) -> ty.List[TypeRef]:
+        """The types that need to have been defined before this class body is executed.
 
-def ask_formats(prompter: Prompter) -> ty.List[FormatSpec]:
-    """Step through the formats the developer wants to define"""
-    preset = prompter.answers.get("formats")
-    if preset is not None:
-        return [
-            FormatSpec(
-                class_name=valid_class_name(f["class_name"]),
-                kind=f["kind"],
-                docstring=f.get("docstring", ""),
-                ext=valid_extension(f["ext"]) if f.get("ext") else None,
-                side_car_exts=[valid_extension(e) for e in f.get("side_car_exts", [])],
-                content_exts=[valid_extension(e) for e in f.get("content_exts", [])],
-            )
-            for f in preset
-        ]
-    formats: ty.List[FormatSpec] = []
+        Members are excluded: they are only resolved when the property is called, so
+        they can refer to classes defined further down the module.
+        """
+        refs = list(self.side_car_types)
+        if self.header_type:
+            refs.append(self.header_type)
+        refs.extend(m.type_ref for m in self.members)  # for content_types
+        return refs
+
+
+def resolve_mime_like(mime: str) -> TypeRef:
+    """Resolve a mime-like string (e.g. 'application/json') to the class it names.
+
+    Parameters
+    ----------
+    mime : str
+        the mime-like (or mime) string to resolve
+
+    Returns
+    -------
+    TypeRef
+        a reference to the resolved class, importable from the shallowest package that
+        re-exports it
+
+    Raises
+    ------
+    ValueError
+        if the string doesn't name a format that can be found
+    """
+    import importlib
+
+    try:
+        from fileformats.core import from_mime
+    except ImportError:
+        raise ValueError(
+            "'fileformats' isn't installed, so mime-like types can't be resolved"
+        )
+    try:
+        klass = from_mime(mime)
+    except Exception as e:
+        raise ValueError(f"Couldn't resolve {mime!r}: {e}")
+    if not inspect.isclass(klass):
+        raise ValueError(f"{mime!r} didn't resolve to a single format ({klass})")
+    # prefer 'from fileformats.application import Json' over the module it is
+    # implemented in, which is how they are referred to by hand
+    parts = klass.__module__.split(".")
+    for depth in range(2, len(parts) + 1):
+        package = ".".join(parts[:depth])
+        try:
+            module = importlib.import_module(package)
+        except ImportError:  # pragma: no cover - the class was imported from it
+            continue
+        if getattr(module, klass.__name__, None) is klass:
+            return TypeRef(name=klass.__name__, import_from=package)
+    return TypeRef(name=klass.__name__, import_from=klass.__module__)
+
+
+def ask_type(
+    prompter: Prompter,
+    key: str,
+    question: str,
+    known: ty.Sequence[str],
+    pending: ty.List[str],
+    default: ty.Optional[str] = None,
+) -> TypeRef:
+    """Ask for the format of a side-car, header or directory member.
+
+    The answer is one of the formats already described (given by name), a mime-like for
+    a format that already exists (which is resolved, and re-asked if it doesn't), or the
+    name of a new format, which is queued to be described once the formats already begun
+    have been finished with.
+
+    Parameters
+    ----------
+    prompter : Prompter
+        the prompter to ask with
+    key : str
+        the key the answer is stored under
+    question : str
+        what is being asked for
+    known : Sequence[str]
+        the names of the formats described so far
+    pending : list[str]
+        names queued to be described later, appended to if a new name is given
+    default : str, optional
+        the answer taken if the question is just skipped over
+
+    Returns
+    -------
+    TypeRef
+        a reference to the format given
+    """
+    listed = ", ".join(known) if known else "none yet"
     while True:
-        index = len(formats) + 1
-        if formats and not prompter.yes_no(
-            f"_add_format_{index}", "Define another format?", default=False
+        answer = prompter.text(
+            key,
+            f"{question}\n  (a mime-like, e.g. application/json; one of the formats "
+            f"defined here: {listed};\n   or a new name to define afterwards)",
+            default=default,
+        )
+        if answer in known or answer in pending:
+            return TypeRef(name=answer)
+        if "/" in answer:
+            try:
+                return resolve_mime_like(answer)
+            except ValueError as e:
+                print(f"  {e}")
+                if not prompter.interactive:
+                    raise Abort(str(e))
+                continue
+        try:
+            class_name = valid_class_name(answer)
+        except ValueError as e:
+            print(f"  {e}")
+            if not prompter.interactive:
+                raise Abort(str(e))
+            continue
+        if class_name not in pending:
+            pending.append(class_name)
+            print(f"  '{class_name}' will be asked about once this format is done")
+        return TypeRef(name=class_name)
+
+
+def ask_members(
+    prompter: Prompter,
+    index: int,
+    known: ty.Sequence[str],
+    pending: ty.List[str],
+) -> ty.List[MemberSpec]:
+    """Ask for the contents a directory format holds.
+
+    Each one becomes a property on the class, validated when the format is validated if
+    it is required, so that a directory missing it isn't mistaken for this format.
+    """
+    members: ty.List[MemberSpec] = []
+    if not prompter.yes_no(
+        f"format_{index}_has_members",
+        "Does it have contents that should be checked for, and accessible as properties?",
+        default=False,
+        explanation=(
+            "  (e.g. a 'info_file' property for the 'info' file it must contain, which\n"
+            "   makes a directory without one fail to validate as this format)"
+        ),
+    ):
+        return members
+    while True:
+        position = len(members) + 1
+        if members and not prompter.yes_no(
+            f"format_{index}_member_{position}_another", "  Another?", default=False
         ):
             break
-        print(f"\n--- Format {index} ---")
+        attr_name = prompter.text(
+            f"format_{index}_member_{position}_name",
+            f"  Name of property {position} (e.g. info_file)",
+            validator=valid_package_name,
+        )
+        pattern = prompter.text(
+            f"format_{index}_member_{position}_pattern",
+            "  File name, or a glob to match it by (e.g. info, or *.sfcm)",
+        )
+        type_ref = ask_type(
+            prompter,
+            f"format_{index}_member_{position}_type",
+            "  Its format",
+            known,
+            pending,
+        )
+        is_glob = any(c in pattern for c in "*?[")
+        multiple = (
+            prompter.yes_no(
+                f"format_{index}_member_{position}_multiple",
+                "  Are there many of them (giving a dict keyed by file stem)?",
+                default=False,
+            )
+            if is_glob
+            else False
+        )
+        required = prompter.yes_no(
+            f"format_{index}_member_{position}_required",
+            "  Is it required (i.e. checked when the format is validated)?",
+            default=True,
+        )
+        members.append(
+            MemberSpec(
+                attr_name=attr_name,
+                type_ref=type_ref,
+                pattern=pattern,
+                is_glob=is_glob,
+                multiple=multiple,
+                required=required,
+            )
+        )
+    return members
+
+
+def ask_format(
+    prompter: Prompter,
+    index: int,
+    known: ty.Sequence[str],
+    pending: ty.List[str],
+    class_name: ty.Optional[str] = None,
+) -> FormatSpec:
+    """Ask for one format.
+
+    Parameters
+    ----------
+    prompter : Prompter
+        the prompter to ask with
+    index : int
+        which format this is, used to key the answers
+    known : Sequence[str]
+        the names of the formats described so far
+    pending : list[str]
+        names queued to be described later, appended to by the type questions
+    class_name : str, optional
+        the name it was referred to by, when it was queued by an earlier format
+
+    Returns
+    -------
+    FormatSpec
+        the format as described
+    """
+    print(f"\n--- Format {index}{': ' + class_name if class_name else ''} ---")
+    if class_name is None:
         class_name = prompter.text(
             f"format_{index}_class_name",
             "Class name of the format (e.g. VectraExport)",
             validator=valid_class_name,
         )
-        kind = prompter.choice(
-            f"format_{index}_kind",
-            "What sort of data does it hold?",
-            [FILE, FILE_WITH_SIDE_CARS, DIRECTORY],
-            default=FILE,
+    kind = prompter.choice(
+        f"format_{index}_kind",
+        "What sort of data does it hold?",
+        [FILE, FILE_WITH_SIDE_CARS, FILE_WITH_SEPARATE_HEADER, DIRECTORY],
+        default=FILE,
+    )
+    docstring = prompter.text(
+        f"format_{index}_docstring",
+        "One-line description",
+        default=f"{class_name} format",
+    )
+
+    ext = magic_number = None
+    binary = True
+    has_magic_number = False
+    side_car_types: ty.List[TypeRef] = []
+    header_type: ty.Optional[TypeRef] = None
+    members: ty.List[MemberSpec] = []
+
+    if kind != DIRECTORY:
+        ext = prompter.text(
+            f"format_{index}_ext",
+            "File extension (e.g. .tom)",
+            validator=valid_extension,
         )
-        docstring = prompter.text(
-            f"format_{index}_docstring",
-            "One-line description",
-            default=f"{class_name} format",
+        binary = (
+            prompter.choice(
+                f"format_{index}_binary",
+                "Are the contents binary or text?",
+                [BINARY, UNICODE],
+                default=BINARY,
+            )
+            == BINARY
         )
-        ext = side_cars = contents = None
-        if kind in (FILE, FILE_WITH_SIDE_CARS):
-            ext = prompter.text(
-                f"format_{index}_ext",
-                "File extension (e.g. .tom)",
-                validator=valid_extension,
-            )
-        if kind == FILE_WITH_SIDE_CARS:
-            side_cars = prompter.text(
-                f"format_{index}_side_car_exts",
-                "Side-car extensions, comma separated (e.g. .json,.bval)",
-            )
-        if kind == DIRECTORY:
-            contents = prompter.optional_text(
-                f"format_{index}_content_exts",
-                "Extensions of the files the directory contains, comma separated",
-            )
-        formats.append(
-            FormatSpec(
-                class_name=class_name,
-                kind=kind,
-                docstring=docstring,
-                ext=ext,
-                side_car_exts=(
-                    [valid_extension(e) for e in side_cars.split(",")]
-                    if side_cars
-                    else []
+        if binary:
+            has_magic_number = prompter.yes_no(
+                f"format_{index}_has_magic_number",
+                "Does it have a magic number?",
+                default=False,
+                explanation=(
+                    "  (a magic number is a fixed sequence of bytes at the start of a "
+                    "file\n   that identifies its type, e.g. '%PDF-' for PDFs or "
+                    "89504E47 for PNGs)"
                 ),
-                content_exts=(
-                    [valid_extension(e) for e in contents.split(",")]
-                    if contents
-                    else []
-                ),
             )
+            if has_magic_number:
+                magic_number = prompter.optional_text(
+                    f"format_{index}_magic_number",
+                    "  Magic number, in hex (e.g. 89504E47) or as text (e.g. %PDF-)",
+                    blank_hint="to fill in later",
+                )
+
+    if kind == FILE_WITH_SIDE_CARS:
+        count = 1
+        while True:
+            side_car_types.append(
+                ask_type(
+                    prompter,
+                    f"format_{index}_side_car_{count}_type",
+                    f"  Format of side-car {count}",
+                    known,
+                    pending,
+                    default="application/json",
+                )
+            )
+            count += 1
+            if not prompter.yes_no(
+                f"format_{index}_side_car_{count}_another",
+                "  Another side-car?",
+                default=False,
+            ):
+                break
+    elif kind == FILE_WITH_SEPARATE_HEADER:
+        header_type = ask_type(
+            prompter,
+            f"format_{index}_header_type",
+            "  Format of the header file",
+            known,
+            pending,
         )
-        if not prompter.interactive and "formats" not in prompter.answers:
+    elif kind == DIRECTORY:
+        members = ask_members(prompter, index, known, pending)
+
+    return FormatSpec(
+        class_name=class_name,
+        kind=kind,
+        docstring=docstring,
+        ext=ext,
+        side_car_types=side_car_types,
+        header_type=header_type,
+        members=members,
+        binary=binary,
+        has_magic_number=has_magic_number,
+        magic_number=magic_number,
+    )
+
+
+def ask_formats(prompter: Prompter) -> ty.List[FormatSpec]:
+    """Step through the formats the developer wants to define.
+
+    Types referred to by a format's side-cars, header or contents that haven't been
+    described yet are queued as they are named, and asked for once there are no more
+    formats to begin, which in turn may queue more.
+    """
+    preset = prompter.answers.get("formats")
+    if preset is not None:
+        return [format_from_dict(f) for f in preset]
+    formats: ty.List[FormatSpec] = []
+    pending: ty.List[str] = []
+    index = 0
+    while True:
+        index += 1
+        if formats and not prompter.yes_no(
+            f"_add_format_{index}", "\nDefine another format?", default=False
+        ):
             break
+        known = [f.class_name for f in formats]
+        formats.append(ask_format(prompter, index, known, pending))
+        if not prompter.interactive:
+            break
+    # the types that were referred to but not described, in the order they came up
+    while True:
+        described = {f.class_name for f in formats}
+        outstanding = [n for n in pending if n not in described]
+        if not outstanding:
+            break
+        index += 1
+        known = [f.class_name for f in formats]
+        formats.append(
+            ask_format(prompter, index, known, pending, class_name=outstanding[0])
+        )
     return formats
+
+
+def format_from_dict(dct: ty.Dict[str, ty.Any]) -> FormatSpec:
+    """Build a format from pre-supplied answers"""
+
+    def as_type_ref(value: ty.Any) -> TypeRef:
+        if isinstance(value, dict):
+            return TypeRef(name=value["name"], import_from=value.get("import_from"))
+        if "/" in value:
+            return resolve_mime_like(value)
+        return TypeRef(name=value)
+
+    return FormatSpec(
+        class_name=valid_class_name(dct["class_name"]),
+        kind=dct["kind"],
+        docstring=dct.get("docstring", ""),
+        ext=valid_extension(dct["ext"]) if dct.get("ext") else None,
+        side_car_types=[as_type_ref(v) for v in dct.get("side_car_types", [])],
+        header_type=(
+            as_type_ref(dct["header_type"]) if dct.get("header_type") else None
+        ),
+        members=[
+            MemberSpec(
+                attr_name=m["attr_name"],
+                type_ref=as_type_ref(m["type"]),
+                pattern=m["pattern"],
+                is_glob=m.get("is_glob", any(c in m["pattern"] for c in "*?[")),
+                multiple=m.get("multiple", False),
+                required=m.get("required", True),
+            )
+            for m in dct.get("members", [])
+        ],
+        binary=dct.get("binary", True),
+        has_magic_number=dct.get("has_magic_number", bool(dct.get("magic_number"))),
+        magic_number=dct.get("magic_number") or None,
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -620,61 +998,222 @@ def render_extra_stub(hook: Hook, fmt: FormatSpec) -> str:
     )
 
 
+def render_magic_number(value: str) -> str:
+    """Render a magic number as source text.
+
+    Both of the forms `WithMagicNumber` accepts are used in the wild, so hex is
+    rendered as the hex string it documents, and anything else as a byte string.
+
+    Parameters
+    ----------
+    value : str
+        the magic number as given, in hex (e.g. '89504E47') or as the text it spells
+        out (e.g. '%PDF-')
+
+    Returns
+    -------
+    str
+        the value as it should appear in the class body
+    """
+    compact = value.strip().replace(" ", "")
+    if compact.lower().startswith("0x"):
+        compact = compact[2:]
+    try:
+        bytes.fromhex(compact)
+    except ValueError:
+        escaped = value.strip().replace("\\", "\\\\").replace('"', '\\"')
+        return f'b"{escaped}"'
+    return f'"{compact.upper()}"'
+
+
+def order_by_dependency(formats: ty.List[FormatSpec]) -> ty.List[FormatSpec]:
+    """Order the formats so that each is defined after the ones its class body names.
+
+    Side-car, header and content types are looked up when the class body is executed,
+    so they have to appear earlier in the module.
+    """
+    by_name = {f.class_name: f for f in formats}
+    ordered: ty.List[FormatSpec] = []
+    placed: ty.Set[str] = set()
+    placing: ty.Set[str] = set()
+
+    def place(fmt: FormatSpec) -> None:
+        if fmt.class_name in placed or fmt.class_name in placing:
+            return  # already emitted, or a cycle that can't be resolved by ordering
+        placing.add(fmt.class_name)
+        for ref in fmt.referenced_at_class_definition:
+            if ref.is_local and ref.name in by_name:
+                place(by_name[ref.name])
+        placing.discard(fmt.class_name)
+        placed.add(fmt.class_name)
+        ordered.append(fmt)
+
+    for fmt in formats:
+        place(fmt)
+    return ordered
+
+
+def render_member(member: MemberSpec, owner: FormatSpec) -> ty.List[str]:
+    """Render a directory member as a property of the class.
+
+    Required members are validated properties, so that a directory without them doesn't
+    validate as the format; optional ones are plain properties returning None when
+    absent, as their absence shouldn't fail validation.
+    """
+    tp = member.type_ref.name
+    lines = []
+    if member.multiple:
+        returns = f"dict[str, {tp}]"
+        lines.append("    @validated_property" if member.required else "    @property")
+        lines.append(f"    def {member.attr_name}(self) -> {returns}:")
+        lines.append(
+            f'        matches = {{p.stem: {tp}(p) for p in self.fspath.glob("{member.pattern}")}}'
+        )
+        if member.required:
+            lines.append("        if not matches:")
+            lines.append("            raise FormatMismatchError(")
+            lines.append(
+                f'                f"Did not find any {member.pattern} in {{self.fspath}}"'
+            )
+            lines.append("            )")
+        lines.append("        return matches")
+    elif member.is_glob:
+        returns = tp if member.required else f"{tp} | None"
+        lines.append("    @validated_property" if member.required else "    @property")
+        lines.append(f"    def {member.attr_name}(self) -> {returns}:")
+        lines.append(f'        matches = list(self.fspath.glob("{member.pattern}"))')
+        if member.required:
+            lines.append("        if not matches:")
+            lines.append("            raise FormatMismatchError(")
+            lines.append(
+                f'                f"Did not find a {member.pattern} in {{self.fspath}}"'
+            )
+            lines.append("            )")
+            lines.append(f"        return {tp}(matches[0])")
+        else:
+            lines.append(f"        return {tp}(matches[0]) if matches else None")
+    else:
+        if member.required:
+            lines.append("    @validated_property")
+            lines.append(f"    def {member.attr_name}(self) -> {tp}:")
+            lines.append(f'        return {tp}(self.fspath / "{member.pattern}")')
+        else:
+            lines.append("    @property")
+            lines.append(f"    def {member.attr_name}(self) -> {tp} | None:")
+            lines.append(f'        path = self.fspath / "{member.pattern}"')
+            lines.append(f"        return {tp}(path) if path.exists() else None")
+    return lines
+
+
 def render_formats_module(
     formats: ty.List[FormatSpec], namespace_bases: ty.List[str]
 ) -> str:
     """Generate the module defining the format classes"""
+    formats = order_by_dependency(formats)
     generic_imports = set()
     mixin_imports = set()
+    core_imports = set()
+    external_imports: ty.Dict[str, ty.Set[str]] = {}
+    needs_mismatch_error = False
+
+    def note(ref: TypeRef) -> None:
+        if not ref.is_local:
+            external_imports.setdefault(str(ref.import_from), set()).add(ref.name)
+
     for fmt in formats:
         if fmt.kind == DIRECTORY:
-            generic_imports.add("Directory")
+            # content_types are only checked by TypedDirectory; on a plain Directory
+            # they are inert metadata
+            generic_imports.add("TypedDirectory" if fmt.members else "Directory")
         else:
-            generic_imports.add("BinaryFile")
+            generic_imports.add("BinaryFile" if fmt.binary else "UnicodeFile")
         if fmt.kind == FILE_WITH_SIDE_CARS:
             mixin_imports.add("WithSideCars")
+        if fmt.kind == FILE_WITH_SEPARATE_HEADER:
+            mixin_imports.add("WithSeparateHeader")
+        if fmt.has_magic_number:
+            mixin_imports.add("WithMagicNumber")
+        for ref in fmt.side_car_types:
+            note(ref)
+        if fmt.header_type:
+            note(fmt.header_type)
+        for member in fmt.members:
+            note(member.type_ref)
+            core_imports.add("validated_property" if member.required else "")
+            if member.required:
+                needs_mismatch_error = True
+    core_imports.discard("")
+
     lines = []
-    if generic_imports:
-        lines.append(
-            f"from fileformats.generic import {', '.join(sorted(generic_imports))}"
-        )
+    if core_imports:
+        lines.append(f"from fileformats.core import {', '.join(sorted(core_imports))}")
+    if needs_mismatch_error:
+        lines.append("from fileformats.core.exceptions import FormatMismatchError")
     if mixin_imports:
         lines.append(
             f"from fileformats.core.mixin import {', '.join(sorted(mixin_imports))}"
         )
-    for imp in namespace_bases:
-        lines.append(imp)
+    if generic_imports:
+        lines.append(
+            f"from fileformats.generic import {', '.join(sorted(generic_imports))}"
+        )
+    for module in sorted(external_imports):
+        lines.append(
+            f"from {module} import {', '.join(sorted(external_imports[module]))}"
+        )
+    lines.extend(namespace_bases)
+
     body = ["\n".join(lines), "", ""]
     for fmt in formats:
         bases = []
+        if fmt.has_magic_number:
+            bases.append("WithMagicNumber")
         if fmt.kind == FILE_WITH_SIDE_CARS:
             bases.append("WithSideCars")
-        bases.append("Directory" if fmt.kind == DIRECTORY else "BinaryFile")
+        if fmt.kind == FILE_WITH_SEPARATE_HEADER:
+            bases.append("WithSeparateHeader")
+        if fmt.kind == DIRECTORY:
+            bases.append("TypedDirectory" if fmt.members else "Directory")
+        else:
+            bases.append("BinaryFile" if fmt.binary else "UnicodeFile")
         bases.extend(base_name_of(imp) for imp in namespace_bases)
         body.append(f"class {fmt.class_name}({', '.join(bases)}):")
         body.append(f'    """{fmt.docstring}"""')
         body.append("")
+        declared = False
         if fmt.ext:
             body.append(f'    ext = "{fmt.ext}"')
-        if fmt.side_car_exts:
-            listed = ", ".join(repr(e) for e in fmt.side_car_exts)
-            body.append(
-                f"    # TODO: the fileformats classes of the side-cars ({listed}),"
-            )
-            body.append(
-                "    # e.g. 'from fileformats.application import Json' for '.json'"
-            )
-            body.append("    side_car_types = ()")
-        if fmt.content_exts:
-            listed = ", ".join(repr(e) for e in fmt.content_exts)
-            body.append(
-                f"    # TODO: the fileformats classes of the contents ({listed}),"
-            )
-            body.append(
-                "    # e.g. 'from fileformats.application import Json' for '.json'"
-            )
-            body.append("    content_types = ()")
-        if not (fmt.ext or fmt.side_car_exts or fmt.content_exts):
+            declared = True
+        if fmt.has_magic_number:
+            if fmt.magic_number:
+                body.append(
+                    f"    magic_number = {render_magic_number(fmt.magic_number)}"
+                )
+            else:
+                body.append(
+                    '    # TODO: the magic number, in hex (e.g. "89504E47") or as a'
+                )
+                body.append('    # byte string (e.g. b"%PDF-"). NB: until it is filled')
+                body.append("    # in, no file will validate as this format")
+                body.append('    magic_number = ""')
+            declared = True
+        if fmt.side_car_types:
+            names = ", ".join(r.name for r in fmt.side_car_types)
+            suffix = "," if len(fmt.side_car_types) == 1 else ""
+            body.append(f"    side_car_types = ({names}{suffix})")
+            declared = True
+        if fmt.header_type:
+            body.append(f"    header_type = {fmt.header_type.name}")
+            declared = True
+        if fmt.members:
+            content = sorted({m.type_ref.name for m in fmt.members})
+            suffix = "," if len(content) == 1 else ""
+            body.append(f"    content_types = ({', '.join(content)}{suffix})")
+            declared = True
+            for member in fmt.members:
+                body.append("")
+                body.extend(render_member(member, fmt))
+        if not declared:
             body.append("    pass")
         body.extend(["", ""])
     return "\n".join(body).rstrip() + "\n"
@@ -1090,9 +1629,20 @@ def main(argv: ty.Optional[ty.Sequence[str]] = None) -> int:
         print(f"  formats module: {module_name}.py")
         print(f"  author:        {author} <{email}>")
         for fmt in formats:
-            detail = fmt.ext or ", ".join(fmt.content_exts) or ""
+            detail = fmt.ext or ", ".join(
+                sorted({m.type_ref.name for m in fmt.members})
+            )
+            described = fmt.kind if fmt.binary else f"text {fmt.kind}"
+            if fmt.has_magic_number:
+                detail += f", magic {fmt.magic_number or 'TBC'}"
+            if fmt.side_car_types:
+                detail += " + side-cars " + ", ".join(
+                    r.name for r in fmt.side_car_types
+                )
+            if fmt.header_type:
+                detail += f" + {fmt.header_type.name} header"
             print(
-                f"    - {fmt.class_name} ({fmt.kind}{': ' + detail if detail else ''})"
+                f"    - {fmt.class_name} ({described}{': ' + detail if detail else ''})"
             )
         if chosen_hooks:
             print(f"  extras stubs:  {', '.join(h.name for h in chosen_hooks)}")

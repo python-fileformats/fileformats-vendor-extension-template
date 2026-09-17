@@ -1,6 +1,6 @@
 # How to customise this template
 
-Run `python3 customise.py` to be walked through the steps below and have them applied for you, or work through them by hand:
+Run `python3 customise.py` to be walked through the steps below and have them applied for you (STRONGLY RECOMMENDED), or work through them by hand:
 
 1. Name your repository with the name `fileformats-vendor-<YOUR-VENDOR-NAME>`
 1. Rename the `fileformats/vendor/CHANGEME/MIMELIKE.py` and `extras/fileformats/extras/vendor/CHANGEME/MIMELIKE.py` to the name of the "mime-like" type of the data the formats hold, e.g. `fileformats/vendor/CHANGEME/medimage.py`, `fileformats/vendor/CHANGEME/biosig.py`
