@@ -795,7 +795,8 @@ def ask_format(
             if has_magic_number:
                 magic_number = prompter.optional_text(
                     f"format_{index}_magic_number",
-                    "  Magic number, in hex (e.g. 89504E47) or as text (e.g. %PDF-)",
+                    "  Magic number, in hex (e.g. 89504E47; needed for spaces and "
+                    "non-printable bytes)\n  or as text (e.g. %PDF-)",
                     blank_hint="to fill in later",
                 )
 
@@ -1001,14 +1002,16 @@ def render_extra_stub(hook: Hook, fmt: FormatSpec) -> str:
 def render_magic_number(value: str) -> str:
     """Render a magic number as source text.
 
-    Both of the forms `WithMagicNumber` accepts are used in the wild, so hex is
-    rendered as the hex string it documents, and anything else as a byte string.
+    Both of the forms `WithMagicNumber` accepts are used in the wild, so a value that
+    reads as hex is rendered as the hex string it documents, and anything else as a byte
+    string. Whitespace is only insignificant in the hex form, so the text form is taken
+    exactly as given, with anything unprintable escaped.
 
     Parameters
     ----------
     value : str
-        the magic number as given, in hex (e.g. '89504E47') or as the text it spells
-        out (e.g. '%PDF-')
+        the magic number as given, in hex (e.g. '89504E47', or '89 50 4E 47') or as the
+        text it spells out (e.g. '%PDF-')
 
     Returns
     -------
@@ -1021,9 +1024,19 @@ def render_magic_number(value: str) -> str:
     try:
         bytes.fromhex(compact)
     except ValueError:
-        escaped = value.strip().replace("\\", "\\\\").replace('"', '\\"')
-        return f'b"{escaped}"'
-    return f'"{compact.upper()}"'
+        pass
+    else:
+        return f'"{compact.upper()}"'
+    literal = ""
+    for byte in value.encode():
+        char = chr(byte)
+        if char in '"\\':
+            literal += "\\" + char
+        elif 32 <= byte < 127:
+            literal += char
+        else:
+            literal += f"\\x{byte:02x}"
+    return f'b"{literal}"'
 
 
 def order_by_dependency(formats: ty.List[FormatSpec]) -> ty.List[FormatSpec]:
@@ -1256,10 +1269,58 @@ def render_extras_module(
     return "\n".join(blocks).rstrip() + "\n"
 
 
-def render_init(module_name: str, formats: ty.List[FormatSpec]) -> str:
-    """Generate the package __init__, re-exporting the format classes"""
+def render_base_module(class_name: str, docstring: str) -> str:
+    """Generate the module defining the namespace's own base class.
+
+    An extension package defines a namespace, i.e. a qualitative type of data, and the
+    base class is what says so: the formats in the package derive from it, and any
+    'extras' hooks particular to that type of data are declared on it.
+
+    Parameters
+    ----------
+    class_name : str
+        the name of the base class (e.g. 'Biosig')
+    docstring : str
+        what the namespace covers (e.g. 'Base class for biophysical recordings')
+
+    Returns
+    -------
+    str
+        the contents of the base module
+    """
+    return f'''import os  # noqa: F401
+import typing as ty  # noqa: F401
+
+from fileformats.core import FileSet, extra  # noqa: F401
+
+
+class {class_name}(FileSet):
+    """{docstring}"""
+
+    # Hooks declared here are the ones that make sense for this type of data, and are
+    # implemented in the 'extras' package for each format that supports them, e.g.
+    #
+    #     @extra
+    #     def deidentify(
+    #         self,
+    #         out_dir: os.PathLike[str],
+    #         spec: ty.Any = None,
+    #         **kwargs: ty.Any,
+    #     ) -> ty.Self:
+    #         """Strip any identifying information from the data"""
+'''
+
+
+def render_init(
+    module_name: str,
+    formats: ty.List[FormatSpec],
+    base_class: ty.Optional[str] = None,
+) -> str:
+    """Generate the package __init__, re-exporting the base and format classes"""
     names = [f.class_name for f in formats]
     lines = ["from ._version import __version__"]
+    if base_class:
+        lines.append(f"from .base import {base_class}")
     if names:
         lines.append(f"from .{module_name} import (")
         lines.extend(f"    {n}," for n in names)
@@ -1267,6 +1328,8 @@ def render_init(module_name: str, formats: ty.List[FormatSpec]) -> str:
     lines.append("")
     lines.append("__all__ = [")
     lines.append('    "__version__",')
+    if base_class:
+        lines.append(f'    "{base_class}",')
     lines.extend(f'    "{n}",' for n in names)
     lines.append("]")
     return "\n".join(lines) + "\n"
@@ -1517,14 +1580,39 @@ def main(argv: ty.Optional[ty.Sequence[str]] = None) -> int:
                 validator=valid_package_name,
             )
             distribution = f"fileformats-{pkg_name.replace('_', '-')}"
-            namespace = prompter.optional_text(
-                "namespace",
-                "Is there an existing fileformats namespace these formats extend "
-                "(e.g. medimage), whose 'extras' hooks should be offered",
-                validator=valid_package_name,
-            )
+            # an extension package *is* a namespace -- it defines a qualitative type of
+            # data (e.g. 'biosig' for biophysical recordings) rather than sitting within
+            # a namespace someone else defined, which is what the vendor template is for
+            namespace = None
         author = prompter.text("author_name", "Your name (for pyproject.toml)")
         email = prompter.text("author_email", "Your email address")
+
+        # ---- the namespace's own base class ------------------------------------------
+        base_class: ty.Optional[str] = None
+        base_class_docstring = ""
+        if not layout.is_vendor:
+            if prompter.yes_no(
+                "has_base_class",
+                f"Define a base class for the '{pkg_name}' namespace?",
+                default=True,
+                explanation=(
+                    "  (a namespace covers a qualitative type of data, and its base "
+                    "class is what\n   says so: the formats derive from it, and any "
+                    "'extras' hooks particular to\n   that type of data are declared "
+                    "on it)"
+                ),
+            ):
+                base_class = prompter.text(
+                    "base_class_name",
+                    "  Name of the base class",
+                    default=pkg_name[0].upper() + pkg_name[1:],
+                    validator=valid_class_name,
+                )
+                base_class_docstring = prompter.text(
+                    "base_class_docstring",
+                    "  What the namespace covers",
+                    default=f"Base class for {pkg_name} data",
+                )
 
         # ---- make sure the hooks can be detected ------------------------------------
         if not fileformats_available() and not os.environ.get(BOOTSTRAP_ENV_VAR):
@@ -1582,8 +1670,8 @@ def main(argv: ty.Optional[ty.Sequence[str]] = None) -> int:
                 base_options,
                 default=base_options[:1],
             )
-            if base_options
-            else []
+            if base_options and not base_class
+            else base_options[:1]
         )
         selected_bases = [
             c
@@ -1597,6 +1685,9 @@ def main(argv: ty.Optional[ty.Sequence[str]] = None) -> int:
         base_imports = [
             f"from {c.__module__} import {c.__name__}" for c in format_bases
         ]
+        if base_class:
+            # the namespace's own base class, which lives alongside the formats
+            base_imports.append(f"from .base import {base_class}")
 
         # ---- the formats ------------------------------------------------------------
         print(
@@ -1627,6 +1718,8 @@ def main(argv: ty.Optional[ty.Sequence[str]] = None) -> int:
         print(f"  package:       {layout.module_path}.{pkg_name}")
         print(f"  extras:        {layout.extras_module_path}.{pkg_name}")
         print(f"  formats module: {module_name}.py")
+        if base_class:
+            print(f"  base class:    {base_class} (in base.py)")
         print(f"  author:        {author} <{email}>")
         for fmt in formats:
             detail = fmt.ext or ", ".join(
@@ -1666,10 +1759,16 @@ def main(argv: ty.Optional[ty.Sequence[str]] = None) -> int:
             {PLACEHOLDER: pkg_name, NAME_PLACEHOLDER: author, EMAIL_PLACEHOLDER: email},
         )
 
+        if base_class:
+            (pkg_dir / "base.py").write_text(
+                render_base_module(base_class, base_class_docstring)
+            )
         if formats:
             formats_module = pkg_dir / f"{module_name}.py"
             formats_module.write_text(render_formats_module(formats, base_imports))
-            (pkg_dir / "__init__.py").write_text(render_init(module_name, formats))
+            (pkg_dir / "__init__.py").write_text(
+                render_init(module_name, formats, base_class)
+            )
             extras_module = extras_pkg_dir / f"{module_name}.py"
             extras_module.write_text(
                 render_extras_module(
