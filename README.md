@@ -1,8 +1,10 @@
 # How to customise this template
 
+Run `python3 customise.py` to be walked through the steps below and have them applied for you, or work through them by hand:
+
 1. Name your repository with the name `fileformats-vendor-<YOUR-VENDOR-NAME>`
 1. Rename the `fileformats/vendor/CHANGEME/MIMELIKE.py` and `extras/fileformats/extras/vendor/CHANGEME/MIMELIKE.py` to the name of the "mime-like" type of the data the formats hold, e.g. `fileformats/vendor/CHANGEME/medimage.py`, `fileformats/vendor/CHANGEME/biosig.py`
-1. Rename the `fileformats/vendor/CHANGEME` and `extras/fileformats/vendor/CHANGEME` directories to the name of the vendor, i.e. 
+1. Rename the `fileformats/vendor/CHANGEME` and `extras/fileformats/vendor/CHANGEME` directories to the name of the vendor, i.e.
 1. Search and replace "CHANGEME" with the name of the vendor across all files in the repository
 1. Replace name + email placeholders in `pyproject.toml` for developers and maintainers
 1. Implement extension file-format classes in the `fileformats/vendor/<YOUR-VENDOR-NAME>/<YOUR-MIMELIKE-TYPE>.py`
